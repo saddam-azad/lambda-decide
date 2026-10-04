@@ -1,0 +1,41 @@
+{
+  "name": "lambda-decide",
+  "version": "0.1.0",
+  "description": "Typed, calibrated System One decisions (Choice / Score / Noul) for AWS Lambda: client, confidence gating, and a CDK gateway construct for Jev or any /v1/systemone backend.",
+  "keywords": ["jev", "system-one", "aws-lambda", "cdk", "decision-model", "calibration", "typescript"],
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "engines": { "node": ">=22.18" },
+  "files": ["src", "README.md", "LICENSE"],
+  "exports": {
+    ".": { "types": "./src/index.ts", "default": "./src/index.ts" },
+    "./cdk": { "types": "./src/cdk/index.ts", "default": "./src/cdk/index.ts" },
+    "./handler": { "types": "./src/handler/index.ts", "default": "./src/handler/index.ts" },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "synth": "cdk synth --app \"npx tsx handler.ts\"",
+    "prepublishOnly": "bun run typecheck && bun run test"
+  },
+  "peerDependencies": {
+    "aws-cdk-lib": "^2.272.0",
+    "constructs": "^10.4.0"
+  },
+  "peerDependenciesMeta": {
+    "aws-cdk-lib": { "optional": true },
+    "constructs": { "optional": true }
+  },
+  "devDependencies": {
+    "@aws-sdk/client-ssm": "^3.1146.0",
+    "@types/aws-lambda": "^8.10.164",
+    "@types/node": "^24.0.0",
+    "aws-cdk": "^2.1144.0",
+    "aws-cdk-lib": "^2.272.0",
+    "constructs": "^10.4.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

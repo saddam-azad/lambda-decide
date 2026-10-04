@@ -1,0 +1,4 @@
+{
+  "type": "module",
+  "//": "Shipped in the Lambda asset so nodejs24.x treats handler/*.ts as ES modules. src/ is the zip root, so this is the nearest package.json once the sources land in /var/task."
+}
