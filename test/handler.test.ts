@@ -88,6 +88,26 @@ test("oversized body is rejected", async () => {
   assert.equal((await handler(event(goodBody))).statusCode, 400);
 });
 
+test("config.timeoutMs is the upstream deadline, and gives up as a 504 timeout", async () => {
+  // The construct writes timeoutMs into DECIDE_CONFIG so the client gives up before the function
+  // does; ignored, this would burn the client's own 15s x 3 attempts and the caller would get
+  // Lambda's timeout instead of a typed 504. The message naming 30ms is the proof it was used.
+  const hanging: typeof fetch = (_u, init) => new Promise((_res, rej) => {
+    const keepAlive = setInterval(() => {}, 1_000);
+    init?.signal?.addEventListener("abort", () => { clearInterval(keepAlive); rej(init.signal!.reason); });
+  });
+  const logs: string[] = [];
+  const res = await createHandler({
+    config: { backend: { preset: "openrouter" }, timeoutMs: 30 },
+    fetch: hanging,
+    log: (l) => logs.push(l),
+  })(event(goodBody));
+
+  assert.equal(res.statusCode, 504);
+  assert.equal(JSON.parse(res.body as string).error.type, "timeout");
+  assert.match(logs.join(), /timed out after 30ms/);
+});
+
 test("upstream failures map to 5xx and do not leak upstream bodies", async () => {
   const backend: Backend = { name: "fake", model: "m", async evaluate() { throw new (await import("../src/index.ts")).DecideError("upstream", "secret upstream detail", { status: 500 }); } };
   const logs: string[] = [];

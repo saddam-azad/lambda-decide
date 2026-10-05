@@ -20,6 +20,10 @@ export interface DecisionGatewayProps {
    *
    * The gateway reads and decrypts it at runtime, so the key never enters the function's
    * configuration and rotates without a redeploy. Omit only if the upstream needs no key.
+   *
+   * Granted `ssm:GetParameter` on that one parameter. Encrypting with your own KMS key
+   * (`--key-id`) also needs `kms:Decrypt` on that key; the construct cannot see it, so grant
+   * it yourself — the default `aws/ssm` key needs nothing extra.
    */
   readonly apiKeySsmParameter?: string;
   /**
@@ -31,6 +35,16 @@ export interface DecisionGatewayProps {
   readonly memorySize?: number;
   /** Per invocation, covers upstream retries. Default 30s. */
   readonly timeout?: Duration;
+  /**
+   * Per-attempt deadline for the upstream call, in ms. Default: 80% of `timeout` divided by
+   * the attempt count, so 8000 on the default 30s invocation.
+   *
+   * Must satisfy `timeoutMs * attempts < timeout`, where attempts is the retry count plus one
+   * (3 today). Enforced at synth: a gateway that cannot outlast its own retries surfaces as an
+   * opaque failure instead of a `timeout` the caller can act on. `retry-after` sleeps are on
+   * top of this budget — the upstream, not this number, decides how long those are.
+   */
+  readonly timeoutMs?: number;
   /** Hard ceiling on concurrent executions, and therefore on spend. Needs spare account concurrency. */
   readonly reservedConcurrency?: number;
   /** In-memory cache per execution environment. Identical (redacted) requests skip the upstream call. */
@@ -50,6 +64,18 @@ export interface DecisionGatewayProps {
 function lambdaAssetDir(): string {
   return fileURLToPath(new URL("..", import.meta.url));
 }
+
+/** Extra attempts the client makes upstream; mirrors systemOne()'s default, which the config does not carry. */
+const UPSTREAM_RETRIES = 2;
+
+const ATTEMPTS = UPSTREAM_RETRIES + 1;
+
+/**
+ * Per-attempt upstream deadline when the caller sets none. 80% of the invocation divided by
+ * the attempt count: 8s on the default 30s timeout, which leaves the rest of the invocation
+ * for cold start, the SSM read and the backoff sleeps between attempts.
+ */
+const defaultTimeoutMs = (invocationMs: number): number => Math.floor((invocationMs * 0.8) / ATTEMPTS);
 
 /**
  * A Lambda Function URL that speaks `POST /v1/systemone`, forwards to Jev (or any compatible backend),
@@ -74,12 +100,30 @@ export class DecisionGateway extends Construct {
       );
     }
 
+    // The worst case is every attempt timing out, and it has to finish before the function
+    // does, or the caller gets a bare Lambda timeout instead of the gateway's own 504.
+    const timeout = props.timeout ?? Duration.seconds(30);
+    const invocationMs = timeout.toMilliseconds();
+    const timeoutMs = props.timeoutMs ?? defaultTimeoutMs(invocationMs);
+    const budgetMs = timeoutMs * ATTEMPTS;
+    if (!(timeoutMs > 0)) {
+      throw new Error(`DecisionGateway: timeoutMs must be a positive number of milliseconds, got ${props.timeoutMs}`);
+    }
+    if (budgetMs >= invocationMs) {
+      throw new Error(
+        `DecisionGateway: timeoutMs ${timeoutMs} x ${ATTEMPTS} upstream attempts (${UPSTREAM_RETRIES} retries) = ` +
+          `${budgetMs}ms, which is not below the ${invocationMs}ms function timeout. ` +
+          `Lower timeoutMs (max ${Math.floor((invocationMs - 1) / ATTEMPTS)}ms here) or raise timeout.`,
+      );
+    }
+
     const config: GatewayConfig = {
       backend: props.backend ?? { preset: "openrouter" },
       ...(props.apiKeySsmParameter ? { apiKeySsm: props.apiKeySsmParameter } : {}),
       ...(props.cache ? { cache: { ttlSeconds: props.cache.ttlSeconds, maxEntries: props.cache.maxEntries ?? 500 } } : {}),
       ...(props.redact?.length ? { redact: props.redact } : {}),
       ...(props.maxBodyBytes ? { maxBodyBytes: props.maxBodyBytes } : {}),
+      timeoutMs,
     };
 
     this.function = new LambdaFunction(this, "Function", {
@@ -89,7 +133,7 @@ export class DecisionGateway extends Construct {
       handler: "entry.handler",
       code: Code.fromAsset(lambdaAssetDir(), { exclude: ["cdk/**"] }),
       memorySize: props.memorySize ?? 256,
-      timeout: props.timeout ?? Duration.seconds(30),
+      timeout,
       environment: { DECIDE_CONFIG: JSON.stringify(config) },
       logGroup: new LogGroup(this, "Logs", {
         retention: props.logRetention ?? RetentionDays.ONE_MONTH,
@@ -100,7 +144,10 @@ export class DecisionGateway extends Construct {
     if (props.apiKeySsmParameter) {
       // SSM parameter ARNs drop the leading slash: /a/b -> arn:…:parameter/a/b
       this.function.addToRolePolicy(new PolicyStatement({
-        actions: ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"],
+        // GetParameter is the only call the handler makes. WithDecryption needs no extra action
+        // for the default aws/ssm key, but a customer-managed one also needs kms:Decrypt on it,
+        // which this construct cannot know about — grant that yourself.
+        actions: ["ssm:GetParameter"],
         resources: [Stack.of(this).formatArn({
           service: "ssm",
           resource: "parameter",

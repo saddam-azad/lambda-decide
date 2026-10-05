@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { App, Stack } from "aws-cdk-lib";
+import { App, Duration, Stack } from "aws-cdk-lib";
 import { Annotations, Match, Template } from "aws-cdk-lib/assertions";
 import { Role, ServicePrincipal } from "aws-cdk-lib/aws-iam";
 import { DecisionGateway, type DecisionGatewayProps } from "../src/cdk/index.ts";
@@ -41,6 +41,50 @@ test("the key is read from the SSM parameter you name, by ARN, and never from a 
   // The parameter name reaches the function as config, so the handler knows what to read.
   const [fn] = Object.values(template.findResources("AWS::Lambda::Function"));
   assert.match(JSON.stringify(fn?.Properties.Environment), /lambda-decide\/jev\/api-key/);
+});
+
+test("the SSM grant is exactly GetParameter on that one parameter", () => {
+  // The handler calls GetParameter and nothing else, so GetParameters/GetParametersByPath were
+  // pure over-grant: two more ways for this role to read secrets it has no business seeing.
+  const template = Template.fromStack(build(SSM).stack);
+  const [policy] = Object.values(template.findResources("AWS::IAM::Policy"));
+  const statements: { Action: unknown }[] = policy?.Properties.PolicyDocument.Statement;
+  const ssm = statements.filter((s) => JSON.stringify(s.Action).includes("ssm:"));
+  assert.deepEqual(ssm.map((s) => s.Action), ["ssm:GetParameter"]);
+  assert.doesNotMatch(JSON.stringify(policy?.Properties.PolicyDocument), /kms:/, "a customer-managed key needs kms:Decrypt, which the caller grants");
+});
+
+test("timeoutMs defaults so the whole retry ladder fits inside the function timeout", () => {
+  // 8000ms x 3 attempts = 24s of a 30s invocation. Previously the gateway inherited the client's
+  // own 15s default, i.e. 45s of upstream attempts inside 30s: the function timed out first and
+  // the caller saw an opaque 502 rather than the gateway's 504.
+  const [fn] = Object.values(Template.fromStack(build().stack).findResources("AWS::Lambda::Function"));
+  const config = JSON.parse((fn?.Properties.Environment as { Variables: Record<string, string> }).Variables["DECIDE_CONFIG"]!);
+  assert.equal(config.timeoutMs, 8000);
+  assert.equal(fn?.Properties.Timeout, 30);
+  assert.ok(config.timeoutMs * 3 < (fn?.Properties.Timeout as number) * 1000);
+});
+
+test("an explicit timeoutMs reaches the function, and the default scales with a longer timeout", () => {
+  const envOf = (props: DecisionGatewayProps) => {
+    const [fn] = Object.values(Template.fromStack(build(props).stack).findResources("AWS::Lambda::Function"));
+    return JSON.parse((fn?.Properties.Environment as { Variables: Record<string, string> }).Variables["DECIDE_CONFIG"]!).timeoutMs;
+  };
+  assert.equal(envOf({ timeoutMs: 2500 }), 2500);
+  assert.equal(envOf({ timeout: Duration.seconds(60) }), 16000); // floor(60000 * 0.8 / 3)
+  assert.equal(envOf({ timeout: Duration.seconds(15) }), 4000); // floor(15000 * 0.8 / 3)
+});
+
+test("a timeoutMs that cannot outlast its own retries fails at synth, naming the budget", () => {
+  // A synth-time throw beats a deploy-time gateway that returns 502 on every slow upstream.
+  assert.throws(() => build({ timeoutMs: 11_000 }), /11000 x 3 upstream attempts \(2 retries\) = 33000ms/);
+  assert.throws(() => build({ timeoutMs: 10_000 }), /not below the 30000ms function timeout/);
+  assert.throws(() => build({ timeoutMs: 15_000, timeout: Duration.seconds(30) }), /not below the 30000ms/);
+  assert.doesNotThrow(() => build({ timeoutMs: 9_999 })); // 29997ms: the boundary is strictly below
+  assert.throws(() => build({ timeout: Duration.seconds(9), timeoutMs: 3_000 }), /not below the 9000ms/);
+  assert.doesNotThrow(() => build({ timeout: Duration.seconds(9), timeoutMs: 2_999 })); // 8997ms
+  assert.throws(() => build({ timeoutMs: 0 }), /must be a positive number/);
+  assert.throws(() => build({ timeoutMs: Number.NaN }), /must be a positive number/);
 });
 
 test("no apiKeySsmParameter warns at synth instead of deploying a keyless gateway", () => {

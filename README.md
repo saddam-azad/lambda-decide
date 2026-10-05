@@ -7,11 +7,18 @@ The unit of compatibility here is the `/v1/systemone` protocol, not a model. **J
 ## Install
 
 ```sh
-bun add lambda-decide                      # client only
+bun add lambda-decide                                      # client only
+npm add lambda-decide tsx                                  # client only, on Node
 bun add lambda-decide aws-cdk-lib constructs aws-cdk tsx   # client + gateway
 ```
 
-Node 22.18+, ESM only, TypeScript sources shipped as-is (see [Develop](#develop)).
+**ESM only, and the sources ship as TypeScript.** There is no build step, so `exports` points at `.ts` files — which means the runtime you `import` it with matters. Node's native type stripping refuses to run on anything under `node_modules`: a plain `node` process fails with `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`, on 22.18 and on 24 alike, and no flag changes that. So on Node, run through `tsx`:
+
+```sh
+npx tsx app.ts            # or: node --import tsx app.ts
+```
+
+bun runs the sources natively, so `bun run app.ts` needs nothing extra. The Lambda asset is unaffected by any of this — it is `src/` verbatim, loaded from `/var/task`, which is outside `node_modules`, and the `nodejs24.x` runtime strips the types itself. See [Develop](#develop).
 
 ## The client
 
@@ -68,12 +75,24 @@ backends.typesafe({ model: "jev-1.14" });
 
 `backends.gateway()` targets a `DecisionGateway` you deployed — see [Deploy the gateway](#deploy-the-gateway). It sends no upstream credentials, because the gateway holds the key itself, and it reads no API key from your environment. That matters: SigV4 signing and a bearer token both write the same `authorization` header, so a stray key would overwrite your signature and every call would fail with a puzzling 403. `apiKey` is omitted from its options type and discarded at runtime so that cannot happen.
 
-```ts
-import aws4fetch from "aws4fetch";
+The Function URL is IAM-auth by default, so requests need signing. `aws4fetch` exports an `AwsClient` class rather than a callable — credentials, region and service are constructor arguments, and `.fetch` needs `.bind`, because the client calls it as a plain function:
 
-const signedFetch = aws4fetch({ service: "lambda" });
-const d = decide({ backend: backends.gateway(gatewayUrl, { fetch: signedFetch }) });
+```ts
+import { AwsClient } from "aws4fetch";
+import { decide, backends } from "lambda-decide";
+
+const aws = new AwsClient({
+  accessKeyId:     process.env.AWS_ACCESS_KEY_ID!,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  sessionToken:    process.env.AWS_SESSION_TOKEN,  // only when you assumed a role
+  region:          "eu-north-1",                   // the gateway's region
+  service:         "lambda",
+});
+
+const d = decide({ backend: backends.gateway(gatewayUrl, { fetch: aws.fetch.bind(aws) }) });
 ```
+
+Two things that cost an afternoon if you guess wrong: **region is not inferred reliably**. Left out, `aws4fetch` reads it off the URL host and otherwise falls back to `us-east-1`, which is a 403 `SignatureDoesNotMatch` for a gateway deployed anywhere else. And there is **no default credential chain**: it signs with exactly what you pass, so on ECS, EC2 or SSO resolve credentials with `@aws-sdk/credential-providers` and hand them over. An unbound `aws.fetch` fails as a `network` error, which reads like an outage rather than a missing `bind`.
 
 `fetch` is also the seam for retries, timeouts, and tests on any backend.
 
@@ -131,6 +150,8 @@ aws ssm put-parameter --name /lambda-decide/jev/api-key --type SecureString \
   --value "$(cat ~/.jev-api-key)" --overwrite --profile burner --region us-east-1
 ```
 
+The default `aws/ssm` key needs no extra IAM. Add `--key-id arn:aws:kms:…` to encrypt it with your own, and the function's role also needs `kms:Decrypt` on that key — the construct grants `ssm:GetParameter` and cannot know which key you picked.
+
 This is the only secret step, and the key never enters your code, `.env`, or the Lambda's configuration. `.env` holds the *pointer* to that parameter, not the key — it is gitignored:
 
 ```ini
@@ -186,12 +207,13 @@ npx cdk deploy --app "npx tsx handler.ts" --profile burner
 | Option | Default | Notes |
 |---|---|---|
 | `backend` | `{ preset: "openrouter" }` | `{ preset, model? }` for a preset, or `{ baseUrl, path?, model }` for anything else. `model` overrides the preset's version, so you can upgrade Jev per-stack without editing the library. The default is `openrouter`, so set it explicitly when you mean something else. |
-| `apiKeySsmParameter` | none | Name of an SSM `SecureString` **you** create, holding the upstream key. Omitting it warns at synth, and is correct for a keyless backend like self-hosted Von. The function is granted `ssm:GetParameter` on that one parameter only and reads it at runtime, so the key rotates without a redeploy. |
+| `apiKeySsmParameter` | none | Name of an SSM `SecureString` **you** create, holding the upstream key. Omitting it warns at synth, and is correct for a keyless backend like self-hosted Von. The function is granted `ssm:GetParameter` on that one parameter only and reads it at runtime, so the key rotates without a redeploy. Encrypting the parameter with your own KMS key (`--key-id`) also needs `kms:Decrypt` on that key — the construct cannot see it, so grant it yourself; the default `aws/ssm` key needs nothing extra. |
 | `auth` | `"iam"` | Callers must SigV4-sign. `"none"` makes the URL public and warns at synth. |
 | `redact` | none | `"email"`, `"phone"`, `"card"`, or any case-insensitive regex source. Applied to `state` before the upstream call. |
 | `cache` | off | In-memory per execution environment, not shared across instances. Identical redacted requests skip the upstream call. |
 | `reservedConcurrency` | none | A hard ceiling on spend. Needs spare account concurrency. |
 | `maxBodyBytes` | 256 KiB | |
+| `timeoutMs` | `timeout` × 0.8 ÷ 3 — 8000 on the default 30 s | Per-attempt upstream deadline. Synth fails unless `timeoutMs × 3` stays below `timeout`, because the gateway has to finish its retries before the function dies — otherwise the caller gets an opaque 502 where a `timeout` 504 would have told them what happened. |
 | `memorySize` / `timeout` / `logRetention` | 256 MB / 30 s / one month | The gateway holds no model. |
 
 `grantInvoke(role)` lets another role call the URL. `memorySize` and `logRetention` are standard CDK props; `timeout` is a `Duration`.
@@ -211,7 +233,7 @@ aws cloudformation describe-stacks --stack-name DecisionGateway --profile burner
   --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" --output text
 ```
 
-The Function URL uses **IAM auth** by default, so sign requests with SigV4 — `curl --aws-sigv4 …`, or `aws4fetch` passed to `backends.gateway()`. In the CDK app you can read `gateway.url` directly.
+The Function URL uses **IAM auth** by default, so sign requests with SigV4 — `curl --aws-sigv4 …`, or an [`aws4fetch` client](#backends) passed to `backends.gateway()`. In the CDK app you can read `gateway.url` directly.
 
 ## Notes and limits
 
@@ -220,7 +242,8 @@ The Function URL uses **IAM auth** by default, so sign requests with SigV4 — `
 - Jev through OpenRouter rejects `/chat/completions` with `is a decisions model and cannot be used with the chat/completions endpoint`, naming `/api/alpha/decisions` instead. The preset already posts to `/v1/systemone`, which is the SystemOne-native route and is verified working — so a direct chat/completions call is the thing to avoid, not the preset.
 - Probabilities from Jev vary slightly between identical calls, so gate on bands, not exact values. The cache also makes repeated identical requests stable. A different model will be calibrated differently, which is why bands belong to your own labelled examples.
 - A backend that returns no `probabilities` still parses, but `margin` and `certainty` flatten to `0` and every gate fires. See [Bring your own model](#bring-your-own-model).
-- The gateway's `timeoutMs` upstream deadline is not yet exposed as a construct prop, so a slow upstream can exhaust the 30 s Lambda timeout and surface as an opaque 502.
+- The upstream deadline is per attempt, and there are three attempts. The construct sizes `timeoutMs` from `timeout` and refuses to synth if `timeoutMs × 3` is not below it, so retries always finish inside the invocation. A 429 `retry-after` sleep sits outside that budget — the upstream decides how long it is — so a heavily rate-limited upstream can still run past the function timeout.
+- There is no build step, so the installed package is TypeScript: bun loads it natively, Node needs `tsx`, and a bare `node` process cannot import it at all, because native type stripping stops at `node_modules`. The Lambda is exempt — its copy of `src/` is loaded from `/var/task`. See [Install](#install).
 - Self-hosting an open model on Lambda is slow to cold-start and costs more per decision than hosted Jev. The gateway is still worth it in that case: it keeps the upstream off your network path and keeps the key and PII policy in one place.
 
 ## Develop
@@ -228,10 +251,10 @@ The Function URL uses **IAM auth** by default, so sign requests with SigV4 — `
 ```sh
 bun install
 bun run typecheck   # tsc --noEmit
-bun run test        # node:test, 42 tests, native TypeScript
+bun run test        # node:test, 54 tests, native TypeScript
 bun run synth       # cdk synth for handler.ts
 ```
 
-Node 22.18+, TypeScript 7, ESM only. **There is no build step.** The package ships TypeScript sources and `exports` points at them, so consume it with a TS-aware runtime (bun, `tsx`, or Node 24+). The Lambda asset is `src/` verbatim: `nodejs24.x` strips the types at cold start, `src/entry.mjs` is the committed one-line shim (Lambda's loader only resolves `.js`/`.mjs`/`.cjs`), and `src/package.json` is the nearest manifest marking those `.ts` files as ES modules. `cdk/` is excluded from the asset because it imports `aws-cdk-lib`, which the runtime does not ship. `@aws-sdk/client-ssm` comes from the runtime. No esbuild, no Docker, no `dist/`.
+Node 22.18+, TypeScript 7, ESM only. **There is no build step.** The package ships TypeScript sources and `exports` points at them, so it has to be loaded by a TS-aware runtime — bun, or `tsx` on Node. Node's own stripping is not an option for consumers, because it stops at `node_modules`; the tests install the package into a temp `node_modules` and assert that `node` throws `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`, that `tsx` and bun load all three entry points, and that the same sources load on bare node from `/var/task`. That last one is the Lambda: `nodejs24.x` strips the types at cold start, `src/entry.mjs` is the committed one-line shim (Lambda's loader only resolves `.js`/`.mjs`/`.cjs`), and `src/package.json` is the nearest manifest marking those `.ts` files as ES modules. `cdk/` is excluded from the asset because it imports `aws-cdk-lib`, which the runtime does not ship. `@aws-sdk/client-ssm` comes from the runtime. No esbuild, no Docker, no `dist/`.
 
 Apache-2.0.

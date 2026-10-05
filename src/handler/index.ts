@@ -15,6 +15,7 @@ export interface GatewayConfig {
   readonly redact?: readonly string[];
   /** Default 256 KiB. */
   readonly maxBodyBytes?: number;
+  /** Per-attempt deadline for the upstream call, ms. The construct sets this from its timeout budget. */
   readonly timeoutMs?: number;
 }
 
